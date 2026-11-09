@@ -9,6 +9,7 @@ import "@tensorflow/tfjs-backend-cpu";
 import * as cocoSsd from "@tensorflow-models/coco-ssd";
 import * as mobilenet from "@tensorflow-models/mobilenet";
 import * as poseDetection from "@tensorflow-models/pose-detection";
+import { isDrinkingAction, isReliableFloorSitting, prioritizeDetections } from "@/lib/violationDetection";
 import {
   Activity,
   ArrowLeft,
@@ -114,7 +115,7 @@ export default function Home() {
   const [cameraError, setCameraError] = useState("");
   const [modelLoading, setModelLoading] = useState(false);
   const [testAlert, setTestAlert] = useState(false);
-  const [detectedItems, setDetectedItems] = useState<{ label: string; score: number; x: number; y: number; width: number; height: number }[]>([]);
+  const [detectedItems, setDetectedItems] = useState<{ label: string; score: number; x: number; y: number; width: number; height: number; trackingId?: string }[]>([]);
   const [trackedPeople, setTrackedPeople] = useState<TrackedPerson[]>([]);
   const [journeyStage, setJourneyStage] = useState<JourneyStage>("idle");
   const [journey, setJourney] = useState({ trackingId: "", tripId: "", cardId: "", currentCamera: "—", violationStatus: "None", cardStatus: "ACTIVE", exitTime: "—" });
@@ -137,10 +138,12 @@ export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const lastAlertRef = useRef("");
   const lastPersistedDetectionRef = useRef("");
+  const violationCandidateRef = useRef({ label: "", frames: 0 });
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const modelRef = useRef<any>(null);
   const tracksRef = useRef<TrackedPerson[]>([]);
   const nextPersonIdRef = useRef(34);
+  const linkedPersonIdRef = useRef<string | null>(null);
   const evidenceInputRef = useRef<HTMLInputElement>(null);
   const [uploadMessage, setUploadMessage] = useState("");
   const evidenceQuery = trpc.evidence.list.useQuery(undefined, { enabled: isAuthenticated, retry: false });
@@ -163,6 +166,7 @@ export default function Home() {
   useEffect(() => {
     const nextTripId = selectedActiveTrip?.tripId ?? "";
     const nextCardId = selectedActiveTrip?.cardUid ?? "";
+    linkedPersonIdRef.current = null;
     setJourney((current) => current.tripId === nextTripId
       ? current
       : { ...current, tripId: nextTripId, cardId: nextCardId || (nextTripId ? current.cardId : "") });
@@ -258,41 +262,92 @@ export default function Home() {
           });
           tracksRef.current = nextTracks;
           setTrackedPeople(nextTracks);
+          if (journey.tripId && !linkedPersonIdRef.current) linkedPersonIdRef.current = nextTracks[0]?.id ?? null;
           const classifications = modelRef.current.classifier !== "unavailable" ? await modelRef.current.classifier.classify(video, 3) : [];
           const foodWords = ["food", "dish", "meal", "pizza", "burger", "cheeseburger", "hot dog", "sandwich", "burrito", "taco", "cake", "doughnut", "pretzel", "bagel", "fruit", "apple", "banana", "orange", "lemon", "strawberry", "broccoli", "mushroom", "plate", "bowl", "cup", "coffee", "espresso", "water bottle"];
           const relevant = predictions
             .filter((item: any) => ["bottle", "cup", "banana", "apple", "sandwich", "orange", "bowl", "cake", "donut", "hot dog", "pizza"].includes(item.class) && item.score > 0.24)
             .map((item: any) => ({ label: item.class, score: Math.round(item.score * 100), x: item.bbox[0] / video.videoWidth * 100, y: item.bbox[1] / video.videoHeight * 100, width: item.bbox[2] / video.videoWidth * 100, height: item.bbox[3] / video.videoHeight * 100 }));
+          const drinkObjects = predictions.filter((item: any) => ["bottle", "cup"].includes(item.class) && item.score > 0.32);
           const poses = await modelRef.current.pose.estimatePoses(video);
           const pose = poses[0];
-          const keypoint = (name: string) => pose?.keypoints?.find((point: any) => point.name === name && point.score > 0.35);
+          const keypoint = (name: string) => pose?.keypoints?.find((point: any) => point.name === name && point.score > 0.55);
           const person = predictions.find((item: any) => item.class === "person" && item.score > 0.45);
           if (person) {
             const [px, py, pw, ph] = person.bbox;
-            const nearFloor = py + ph > video.videoHeight * 0.78;
-            const lowProfile = pw / Math.max(ph, 1) > 0.72;
             const hips = [keypoint("left_hip"), keypoint("right_hip")].filter(Boolean);
             const knees = [keypoint("left_knee"), keypoint("right_knee")].filter(Boolean);
             const ankles = [keypoint("left_ankle"), keypoint("right_ankle")].filter(Boolean);
+            const shoulders = [keypoint("left_shoulder"), keypoint("right_shoulder")].filter(Boolean);
             const averageY = (points: any[]) => points.length ? points.reduce((sum, point) => sum + point.y, 0) / points.length : 0;
             const hipY = averageY(hips);
             const kneeY = averageY(knees);
             const ankleY = averageY(ankles);
-            const poseSuggestsFloorSitting = hips.length > 0 && knees.length > 0 && ankles.length > 0 && hipY > video.videoHeight * 0.48 && kneeY < hipY + video.videoHeight * 0.14 && ankleY > video.videoHeight * 0.72;
-            if ((nearFloor && lowProfile) || poseSuggestsFloorSitting) relevant.push({ label: "sitting on the floor", score: Math.round(person.score * 100), x: px / video.videoWidth * 100, y: py / video.videoHeight * 100, width: pw / video.videoWidth * 100, height: ph / video.videoHeight * 100 });
+            const shoulderY = averageY(shoulders);
+            const poseConfidence = [...hips, ...knees, ...ankles, ...shoulders].reduce((sum, point: any) => sum + (point?.score ?? 0), 0) / Math.max(hips.length + knees.length + ankles.length + shoulders.length, 1);
+            const bodyHeight = Math.max(ph, 1);
+            const nosePoint = keypoint("nose");
+            const wrists = [keypoint("left_wrist"), keypoint("right_wrist")].filter(Boolean).map((point: any) => ({ x: point.x, y: point.y }));
+            const drinkingObject = drinkObjects.find((item: any) => isDrinkingAction({
+              objectCenterX: item.bbox[0] + item.bbox[2] / 2,
+              objectCenterY: item.bbox[1] + item.bbox[3] / 2,
+              objectWidth: item.bbox[2],
+              objectHeight: item.bbox[3],
+              personX: px,
+              personY: py,
+              personWidth: pw,
+              personHeight: ph,
+              nose: nosePoint ? { x: nosePoint.x, y: nosePoint.y } : undefined,
+              wrists,
+            }));
+            if (drinkingObject) {
+              relevant.splice(0, relevant.length, ...relevant.filter((item: any) => !["bottle", "cup"].includes(item.label)));
+              relevant.push({ label: "drinking", score: Math.round(drinkingObject.score * 100), x: drinkingObject.bbox[0] / video.videoWidth * 100, y: drinkingObject.bbox[1] / video.videoHeight * 100, width: drinkingObject.bbox[2] / video.videoWidth * 100, height: drinkingObject.bbox[3] / video.videoHeight * 100 });
+            } else {
+              relevant.splice(0, relevant.length, ...relevant.filter((item: any) => !["bottle", "cup"].includes(item.label)));
+            }
+            const seatedGeometry = hips.length === 2 && knees.length === 2 && ankles.length === 2 && shoulders.length === 2
+              && isReliableFloorSitting({
+                personScore: person.score,
+                personHeight: bodyHeight,
+                videoHeight: video.videoHeight,
+                poseConfidence,
+                shoulderY,
+                hipY,
+                kneeY,
+                ankleY,
+                hasDrinkObject: Boolean(drinkingObject),
+              });
+            if (seatedGeometry && !relevant.some((item: any) => ["drinking"].includes(item.label))) {
+              relevant.push({ label: "sitting on the floor", score: Math.round(Math.min(person.score, poseConfidence) * 100), x: px / video.videoWidth * 100, y: py / video.videoHeight * 100, width: pw / video.videoWidth * 100, height: ph / video.videoHeight * 100 });
+            }
           }
           const foodClassification = classifications.find((item: any) => foodWords.some((word) => item.className.toLowerCase().includes(word)) && item.probability > 0.24);
-          if (foodClassification && relevant.length === 0) relevant.push({ label: foodClassification.className, score: Math.round(foodClassification.probability * 100), x: 35, y: 25, width: 30, height: 35 });
-          setDetectedItems(relevant);
-          const violation = relevant[0];
-          if (violation && lastAlertRef.current !== violation.label) {
-            lastAlertRef.current = violation.label;
+          if (foodClassification && !["cup", "bottle", "water bottle"].some((word) => foodClassification.className.toLowerCase().includes(word)) && !relevant.some((item: any) => item.label === "sitting on the floor")) relevant.push({ label: foodClassification.className, score: Math.round(foodClassification.probability * 100), x: 35, y: 25, width: 30, height: 35 });
+          const prioritized = prioritizeDetections(relevant) as typeof relevant;
+          const ownedDetections = prioritized.map((item: any) => {
+            const centerX = item.x + item.width / 2;
+            const centerY = item.y + item.height / 2;
+            const owner = nextTracks.find((track) => centerX >= track.x && centerX <= track.x + track.width && centerY >= track.y && centerY <= track.y + track.height)
+              ?? nextTracks[0];
+            return { ...item, trackingId: owner?.id };
+          });
+          const rawViolation = ownedDetections[0];
+          if (rawViolation?.label === violationCandidateRef.current.label) violationCandidateRef.current.frames += 1;
+          else violationCandidateRef.current = { label: rawViolation?.label ?? "", frames: rawViolation ? 1 : 0 };
+          const requiresStability = ["sitting on the floor", "drinking"].includes(rawViolation?.label ?? "");
+          const violation = rawViolation && (!requiresStability || violationCandidateRef.current.frames >= 3) ? rawViolation : undefined;
+          setDetectedItems(violation ? [violation, ...ownedDetections.filter((item: any) => item !== violation)] : []);
+          const violationKey = violation ? `${violation.trackingId ?? "unlinked"}:${violation.label}` : "";
+          if (violation && lastAlertRef.current !== violationKey) {
+            lastAlertRef.current = violationKey;
             if (typeof Notification !== "undefined" && Notification.permission === "granted") new Notification("RSD · Violation detected", { body: `${violation.label} detected. Please review the camera evidence.` });
-            if (isAuthenticated && lastPersistedDetectionRef.current !== violation.label) {
+            if (isAuthenticated && lastPersistedDetectionRef.current !== violationKey) {
               const linkedTripId = selectedActiveTrip?.tripId ?? journey.tripId;
               if (linkedTripId) {
-                lastPersistedDetectionRef.current = violation.label;
-                recordDetection.mutate({ detectionType: violationName(violation.label), cameraId: simulationCamera, trackingId: journey.trackingId || undefined, tripId: linkedTripId, confidence: violation.score, source: "camera", occurredAt: Date.now() });
+                lastPersistedDetectionRef.current = violationKey;
+                const isLinkedPerson = violation.trackingId !== undefined && violation.trackingId === linkedPersonIdRef.current;
+                recordDetection.mutate({ detectionType: violationName(violation.label), cameraId: simulationCamera, trackingId: undefined, tripId: isLinkedPerson ? linkedTripId : undefined, confidence: violation.score, source: "camera", occurredAt: Date.now() });
               } else {
                 setJourneyNotice("Scan an RFID card and refresh the active trip before recording a violation.");
               }
@@ -362,15 +417,17 @@ export default function Home() {
       setDetectedItems([]);
     }, 5000);
   };
-  const violationName = (label?: string) => label === "sitting on the floor" ? "Sitting on the floor" : label === "bottle" || label === "cup" ? "Drinking" : "Eating / drinking";
+  const violationName = (label?: string) => label === "sitting on the floor" ? "Sitting on the floor" : label === "drinking" || label === "bottle" || label === "cup" ? "Drinking" : "Eating / drinking";
+  const personDisplayId = (trackingId: string) => trackingId === linkedPersonIdRef.current && journey.tripId ? journey.tripId : "UNLINKED";
+  const detectionDisplayId = (trackingId?: string) => trackingId === linkedPersonIdRef.current && journey.tripId ? journey.tripId : "UNLINKED";
   const journeyTime = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const addJourneyEvent = (camera: string, note: string) => { setJourneyEvents((events) => [...events, { camera, time: journeyTime(), note }]); setJourney((current) => ({ ...current, currentCamera: camera })); };
-  const scanEntry = () => { const tripId = selectedActiveTrip?.tripId ?? ""; setJourneyStage("active"); setJourneyNotice(tripId ? "" : "No active RFID trip selected. Scan a card and refresh the trip list before starting camera tracking."); setExitCardId(""); setSimulationCamera("C01"); setJourney({ trackingId: "P034", tripId, cardId: "DRB123", currentCamera: "Camera 01", violationStatus: "None", cardStatus: "ACTIVE", exitTime: "—" }); setJourneyEvents([{ camera: "ENTRY", time: journeyTime(), note: tripId ? `${selectedActiveTrip?.cardUid ? "RFID card" : "Active trip"} linked to ${tripId} · P034 created` : "Camera track started · no active RFID trip linked" }, { camera: "Camera 01", time: journeyTime(), note: "Anonymous track acquired · Re-ID 94%" }]); };
-  const switchSimulationCamera = () => { const cameras = ["C01", "C02", "C04", "C05"]; const next = cameras[(cameras.indexOf(simulationCamera) + 1) % cameras.length]; setSimulationCamera(next); if (journeyStage !== "idle" && journeyStage !== "completed" && journeyStage !== "hold") { const label = `Camera ${next.slice(1)}`; addJourneyEvent(label, `P034 matched across cameras · Re-ID ${next === "C02" ? "91%" : next === "C04" ? "94%" : "92%"}`); if (next === "C04") { setJourneyStage("violation-pending"); setJourney((current) => ({ ...current, violationStatus: "Pending · Eating" })); } } };
-  const advanceJourney = () => { if (journeyStage === "active" && !journeyEvents.some((event) => event.camera === "Camera 02")) addJourneyEvent("Camera 02", "Same passenger matched · Re-ID 91%"); else if (journeyStage === "violation-pending") addJourneyEvent("Camera 04", "Violation evidence captured"); else if (journeyStage === "violation-confirmed") addJourneyEvent("Camera 05", "Passenger approaching exit"); };
+  const scanEntry = () => { const tripId = selectedActiveTrip?.tripId ?? ""; const cardId = selectedActiveTrip?.cardUid ?? ""; setJourneyStage("active"); setJourneyNotice(tripId ? "" : "No real RFID trip is available yet. Tap the Arduino card, then wait for the dashboard refresh."); setExitCardId(""); setSimulationCamera("C01"); setJourney({ trackingId: "", tripId, cardId, currentCamera: "Camera 01", violationStatus: "None", cardStatus: "ACTIVE", exitTime: "—" }); setJourneyEvents([{ camera: "ENTRY", time: journeyTime(), note: tripId ? `Real RFID trip linked: ${tripId}` : "Waiting for a real RFID trip from Arduino" }, { camera: "Camera 01", time: journeyTime(), note: tripId ? "Camera tracking linked to the RFID trip" : "No camera identity assigned without RFID" }]); };
+  const switchSimulationCamera = () => { const cameras = ["C01", "C02", "C04", "C05"]; const next = cameras[(cameras.indexOf(simulationCamera) + 1) % cameras.length]; setSimulationCamera(next); if (journeyStage !== "idle" && journeyStage !== "completed" && journeyStage !== "hold") { const label = `Camera ${next.slice(1)}`; addJourneyEvent(label, journey.tripId ? `Trip ${journey.tripId} matched across cameras` : "Waiting for a real RFID trip"); if (next === "C04") { setJourneyStage("violation-pending"); setJourney((current) => ({ ...current, violationStatus: "Pending · Eating" })); } } };
+  const advanceJourney = () => { if (journeyStage === "active" && !journeyEvents.some((event) => event.camera === "Camera 02")) addJourneyEvent("Camera 02", journey.tripId ? `Trip ${journey.tripId} continued to the next camera` : "No RFID trip linked yet"); else if (journeyStage === "violation-pending") addJourneyEvent("Camera 04", "Violation evidence captured"); else if (journeyStage === "violation-confirmed") addJourneyEvent("Camera 05", "Passenger approaching exit"); };
   const flagJourneyViolation = () => { setJourneyStage("violation-pending"); setJourney((current) => ({ ...current, violationStatus: "Pending · Eating" })); addJourneyEvent("Camera 04", "Eating detected · confidence 94%"); };
   const reviewViolation = (status: "Confirmed" | "Rejected") => { setJourneyStage(status === "Confirmed" ? "violation-confirmed" : "active"); setJourney((current) => ({ ...current, violationStatus: status === "Confirmed" ? "Confirmed · Eating" : "Rejected" })); };
-  const scanExit = () => { if (exitCardId.trim().toUpperCase() !== journey.cardId) { setJourneyNotice("Card not linked to an active trip. Try DRB123 for this demo."); return; } const hasConfirmedViolation = journey.violationStatus.startsWith("Confirmed"); setJourneyNotice(""); setJourneyStage(hasConfirmedViolation ? "hold" : "completed"); setJourney((current) => ({ ...current, currentCamera: "EXIT", exitTime: journeyTime(), cardStatus: hasConfirmedViolation ? "HOLD" : "COMPLETED" })); setJourneyEvents((events) => [...events, { camera: "EXIT", time: journeyTime(), note: hasConfirmedViolation ? "Violation found · Card placed on HOLD" : "Exit allowed · Trip completed" }]); };
+  const scanExit = () => { if (!journey.cardId || exitCardId.trim().toUpperCase() !== journey.cardId.toUpperCase()) { setJourneyNotice("The exit card must match the real RFID card linked to this trip."); return; } const hasConfirmedViolation = journey.violationStatus.startsWith("Confirmed"); setJourneyNotice(""); setJourneyStage(hasConfirmedViolation ? "hold" : "completed"); setJourney((current) => ({ ...current, currentCamera: "EXIT", exitTime: journeyTime(), cardStatus: hasConfirmedViolation ? "HOLD" : "COMPLETED" })); setJourneyEvents((events) => [...events, { camera: "EXIT", time: journeyTime(), note: hasConfirmedViolation ? "Violation found · Card placed on HOLD" : "Exit allowed · Trip completed" }]); };
   const markPaid = () => { setJourneyStage("completed"); setJourney((current) => ({ ...current, cardStatus: "ACTIVE", violationStatus: "PAID" })); setJourneyEvents((events) => [...events, { camera: "Ticket counter", time: journeyTime(), note: "Payment recorded · HOLD released · Trip completed" }]); };
   const resetJourney = () => { setJourneyStage("idle"); setJourneyNotice(""); setExitCardId(""); setJourney({ trackingId: "", tripId: "", cardId: "", currentCamera: "—", violationStatus: "None", cardStatus: "ACTIVE", exitTime: "—" }); setJourneyEvents([]); };
 
@@ -428,8 +485,8 @@ export default function Home() {
             <div className="camera-scene" onClick={!cameraActive ? toggleCamera : undefined} onKeyDown={(event) => { if (!cameraActive && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); toggleCamera(); } }} role={!cameraActive ? "button" : undefined} tabIndex={!cameraActive ? 0 : -1} aria-label={!cameraActive ? "Tap to start monitoring" : "Live camera preview"}>
               <video ref={videoRef} className={`device-video ${cameraActive ? "visible" : ""}`} muted playsInline />
               {!cameraActive && <img className="camera-start-image" src="/manus-storage/rsd-camera-start_f3054d44.png" alt="Riyadh Metro monitoring camera start screen" />}
-              {trackedPeople.map((person) => <div className="person-track-box" key={person.id} style={{ left: `${person.x}%`, top: `${person.y}%`, width: `${person.width}%`, height: `${person.height}%` }}><span>{journey.tripId || "NO ACTIVE TRIP"} · {person.score}%</span></div>)}
-              {detectedItems.map((item, index) => <div className="live-detection" key={`${item.label}-${index}`} style={{ left: `${item.x}%`, top: `${item.y}%`, width: `${item.width}%`, height: `${item.height}%` }}><span>{violationName(item.label)} · {item.score}%</span></div>)}
+              {trackedPeople.map((person) => <div className="person-track-box" key={person.id} style={{ left: `${person.x}%`, top: `${person.y}%`, width: `${person.width}%`, height: `${person.height}%` }}><span>{personDisplayId(person.id)} · {person.score}%</span></div>)}
+              {detectedItems.map((item, index) => <div className="live-detection" key={`${item.trackingId ?? "unlinked"}-${item.label}-${index}`} style={{ left: `${item.x}%`, top: `${item.y}%`, width: `${item.width}%`, height: `${item.height}%` }}><span>{detectionDisplayId(item.trackingId)} · {violationName(item.label)} · {item.score}%</span></div>)}
               <div className="scan-line" /><div className="camera-corner" /><div className="camera-corner corner-two" /><div className="scene-label"><Camera size={14} /> Camera {simulationCamera.slice(1)} <span>● {cameraActive ? "LIVE" : "DEMO"}</span></div>
             </div>
             <div className="camera-controls"><button className={`camera-toggle ${cameraActive ? "stop" : ""}`} onClick={toggleCamera}>{cameraActive ? "Stop camera" : "Open camera"}<Camera size={15} /></button><button className="camera-test" onClick={showTestAlert}>Test alert</button>{modelLoading && <span className="camera-loading">Loading vision model...</span>}{cameraError && <span className="camera-error">{cameraError}</span>}</div>
@@ -455,7 +512,7 @@ export default function Home() {
             </div>
             <div className="operations-panel">
               <div className="operations-panel-head"><div><b>Incident review queue</b><small>Live data from the RSD database · refreshes every 15 seconds</small></div><div className="operations-filters"><Search size={14} /><select value={violationFilter} onChange={(event) => setViolationFilter(event.target.value)} aria-label="Filter incidents"><option>All</option><option>Pending</option><option>Confirmed</option><option>Rejected</option></select></div></div>
-              {incidentsQuery.isLoading ? <div className="operations-empty"><Loader2 className="spin" size={18} /> Loading incidents...</div> : incidentsQuery.error ? <div className="operations-empty error-state">Unable to load incidents. Check operator access and database configuration.</div> : incidentsQuery.data?.length ? <div className="incident-list">{incidentsQuery.data.map((row) => <div className="incident-row" key={row.incident.id}><div className="incident-main"><b>{row.detection.detectionType}</b><small>{row.detection.trackingId || "Anonymous track unavailable"} · {row.detection.tripId || "No trip linked"} · {row.detection.cameraId}</small></div><span className={`incident-status ${row.incident.status}`}>{row.incident.status}</span><span className="incident-confidence">{row.detection.confidence}%</span>{row.incident.status === "pending" && user?.role === "admin" ? <div className="incident-actions"><button aria-label="Confirm incident" title="Confirm incident" onClick={() => reviewIncident.mutate({ incidentId: row.incident.id, status: "confirmed" })}><CheckCircle2 size={16} /></button><button aria-label="Reject incident" title="Reject incident" onClick={() => reviewIncident.mutate({ incidentId: row.incident.id, status: "rejected" })}><XCircle size={16} /></button></div> : <span className="incident-reviewed">{row.incident.reviewedAt ? "Reviewed" : "Operator only"}</span>}</div>)}</div> : <div className="operations-empty"><CircleAlert size={18} /> No persisted incidents match this filter.</div>}
+              {incidentsQuery.isLoading ? <div className="operations-empty"><Loader2 className="spin" size={18} /> Loading incidents...</div> : incidentsQuery.error ? <div className="operations-empty error-state">Unable to load incidents. Check operator access and database configuration.</div> : incidentsQuery.data?.length ? <div className="incident-list">{incidentsQuery.data.map((row) => <div className="incident-row" key={row.incident.id}><div className="incident-main"><b>{row.detection.detectionType}</b><small>{row.detection.tripId ? `Trip ${row.detection.tripId}` : "No RFID trip linked"} · {row.detection.cameraId}</small></div><span className={`incident-status ${row.incident.status}`}>{row.incident.status}</span><span className="incident-confidence">{row.detection.confidence}%</span>{row.incident.status === "pending" && user?.role === "admin" ? <div className="incident-actions"><button aria-label="Confirm incident" title="Confirm incident" onClick={() => reviewIncident.mutate({ incidentId: row.incident.id, status: "confirmed" })}><CheckCircle2 size={16} /></button><button aria-label="Reject incident" title="Reject incident" onClick={() => reviewIncident.mutate({ incidentId: row.incident.id, status: "rejected" })}><XCircle size={16} /></button></div> : <span className="incident-reviewed">{row.incident.reviewedAt ? "Reviewed" : "Operator only"}</span>}</div>)}</div> : <div className="operations-empty"><CircleAlert size={18} /> No persisted incidents match this filter.</div>}
             </div>
           </>}
         </div>
