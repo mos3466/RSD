@@ -1,0 +1,1 @@
+ALTER TABLE `trips` ADD `cardUid` varchar(128);

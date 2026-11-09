@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: rasd
+    runtime: node
+    plan: starter
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    startCommand: pnpm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: RSD_BRIDGE_API_KEY
+        generateValue: true
+      - key: VITE_APP_ID
+        sync: false
+      - key: OWNER_OPEN_ID
+        sync: false
+      - key: OAUTH_SERVER_URL
+        value: https://api.manus.im
+      - key: VITE_OAUTH_PORTAL_URL
+        value: https://auth.manus.im
+      - key: BUILT_IN_FORGE_API_URL
+        value: https://forge.manus.im
+      - key: BUILT_IN_FORGE_API_KEY
+        sync: false
+      - key: RSD_RETENTION_DAYS
+        value: 30
+      - key: RSD_DAY_UTC_OFFSET_HOURS
+        value: 3

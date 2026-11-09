@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1792077701843,
+      "tag": "0000_romantic_mad_thinker",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1792361410320,
+      "tag": "0001_jittery_stature",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1792532202921,
+      "tag": "0002_calm_bromley",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1793135537008,
+      "tag": "0003_tired_caretaker",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1793222720755,
+      "tag": "0004_productive_warbird",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1793379242169,
+      "tag": "0005_rfid_scan_state",
+      "breakpoints": true
+    }
+  ]
+}
